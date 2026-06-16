@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, NoReturn, Optional, Union
 
@@ -59,6 +60,16 @@ except:
 
 
 if HAVE_TE:
+    try:
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            fused_mla_rope_mxfp8_quantize_sbhd,
+        )
+    except ImportError:
+        fused_mla_rope_mxfp8_quantize_sbhd = None
+else:
+    fused_mla_rope_mxfp8_quantize_sbhd = None
+
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TELayerNormColumnParallelLinear,
@@ -76,6 +87,45 @@ else:
         set_save_original_input,
         split_te_layernorm_column_parallel_linear,
     ) = (None, None, None, None, None, None)
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
+
+
+def _recipe_name(recipe) -> str:
+    return str(getattr(recipe, "value", recipe)).lower()
+
+
+def _is_quantized_tensor(tensor) -> bool:
+    return hasattr(tensor, "_rowwise_data") or hasattr(tensor, "_columnwise_data")
+
+
+def _maybe_contiguous_mla_tensor(tensor):
+    if tensor is None or _is_quantized_tensor(tensor):
+        return tensor
+    return tensor.contiguous()
+
+
+def _can_use_cudnn_mla_rope_mxfp8_fusion(parallel_attention, packed_seq_params, inference_context):
+    config = parallel_attention.config
+    return (
+        _env_flag_enabled("NVTE_FUSED_MLA_ROPE_MXFP8")
+        and fused_mla_rope_mxfp8_quantize_sbhd is not None
+        and getattr(config, "fp8", None) is not None
+        and getattr(config, "fp8_dot_product_attention", False)
+        and _recipe_name(getattr(config, "fp8_recipe", None)) == "mxfp8"
+        and getattr(config, "apply_rope_fusion", False)
+        and packed_seq_params is None
+        and inference_context is None
+        and not parallel_attention.cache_mla_latents
+        and not parallel_attention.recompute_up_proj
+        and not parallel_attention.offload_qkv_linear
+        and not parallel_attention.offload_core_attention
+        and getattr(config, "context_parallel_size", 1) == 1
+        and config.qk_head_dim == 128
+        and config.qk_pos_emb_head_dim == 64
+        and config.v_head_dim == 128
+    )
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
@@ -362,12 +412,11 @@ class MultiLatentAttention(Attention):
         )
 
         # TODO: Currently, TE can only accept contiguous tensors for MLA
-        query = query.contiguous()
-        key = key.contiguous()
+        query = _maybe_contiguous_mla_tensor(query)
+        key = _maybe_contiguous_mla_tensor(key)
 
         # Value is none during decode for absorption
-        if value is not None:
-            value = value.contiguous()
+        value = _maybe_contiguous_mla_tensor(value)
 
         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
@@ -865,6 +914,22 @@ class MLASelfAttention(MultiLatentAttention):
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
+
+            if (
+                rotary_pos_cos is not None
+                and rotary_pos_sin is not None
+                and _can_use_cudnn_mla_rope_mxfp8_fusion(
+                    self, packed_seq_params, inference_context
+                )
+            ):
+                query, key, value, _ = fused_mla_rope_mxfp8_quantize_sbhd(
+                    q,
+                    kv,
+                    k_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                )
+                return query, key, value
 
             # todo add assert about fusions and caching
             if self.config.apply_rope_fusion:
