@@ -6,6 +6,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Optional, Union
@@ -40,7 +41,13 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import (
+    deprecate_inference_params,
+    get_pg_rank,
+    get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -56,6 +63,71 @@ except ImportError:
     HAVE_FLA = False
 
 logger = logging.getLogger(__name__)
+
+_ATTN_DIM_LOGGED: set[tuple] = set()
+
+
+def _attention_dim_logging_enabled() -> bool:
+    return os.getenv("MCORE_ATTN_DIM_LOG", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def _attention_dim_log_limit() -> int:
+    try:
+        return int(os.getenv("MCORE_ATTN_DIM_LOG_LIMIT", "64"))
+    except ValueError:
+        return 64
+
+
+def _global_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _rank_allowed(global_rank: int) -> bool:
+    rank_spec = os.getenv("MCORE_ATTN_DIM_LOG_RANKS")
+    if not rank_spec:
+        return True
+    try:
+        for item in rank_spec.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "-" in item:
+                start, end = (int(part.strip()) for part in item.split("-", 1))
+                if start <= global_rank <= end:
+                    return True
+            elif int(item) == global_rank:
+                return True
+    except ValueError:
+        return True
+    return False
+
+
+def _dtype_name(tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return "None"
+    return str(tensor.dtype).replace("torch.", "")
+
+
+def _shape_tuple(tensor: Optional[torch.Tensor]) -> tuple | None:
+    if tensor is None:
+        return None
+    return tuple(tensor.shape)
+
+
+def _emit_attention_dim_log(tag: str, fields: dict) -> None:
+    if not _attention_dim_logging_enabled():
+        return
+    global_rank = fields.get("global_rank")
+    if isinstance(global_rank, int) and not _rank_allowed(global_rank):
+        return
+    key = (tag, tuple((name, str(value)) for name, value in fields.items()))
+    if key in _ATTN_DIM_LOGGED or len(_ATTN_DIM_LOGGED) >= _attention_dim_log_limit():
+        return
+    _ATTN_DIM_LOGGED.add(key)
+    body = " ".join(f"{name}={value}" for name, value in fields.items())
+    print(f"[MCORE_ATTN_DIM][{tag}] {body}", flush=True)
 
 
 @dataclass
@@ -470,6 +542,44 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
+        logical_h_qk = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        logical_h_v = self.v_dim_local_tp // self.value_head_dim // self.cp_size
+        _emit_attention_dim_log(
+            "GDN_FLA_INPUT",
+            {
+                "layer": self.layer_number,
+                "global_rank": _global_rank(),
+                "tp_rank": get_pg_rank(self.pg_collection.tp),
+                "tp_world": get_pg_size(self.pg_collection.tp),
+                "cp_rank": get_pg_rank(self.pg_collection.cp),
+                "cp_world": get_pg_size(self.pg_collection.cp),
+                "b": query.shape[0],
+                "s": query.shape[1],
+                "h_q": query.shape[2],
+                "h_k": key.shape[2],
+                "h_v": value.shape[2],
+                "d_q": query.shape[-1],
+                "d_k": key.shape[-1],
+                "d_v": value.shape[-1],
+                "logical_h_q_before_repeat": logical_h_qk,
+                "logical_h_k_before_repeat": logical_h_qk,
+                "logical_h_v": logical_h_v,
+                "repeat_factor": self.num_value_heads // self.num_key_heads,
+                "q_shape": _shape_tuple(query),
+                "k_shape": _shape_tuple(key),
+                "v_shape": _shape_tuple(value),
+                "g_shape": _shape_tuple(g),
+                "beta_shape": _shape_tuple(beta),
+                "q_dtype": _dtype_name(query),
+                "k_dtype": _dtype_name(key),
+                "v_dtype": _dtype_name(value),
+                "g_dtype": _dtype_name(g),
+                "beta_dtype": _dtype_name(beta),
+                "backend": "torch_chunk_gated_delta_rule"
+                if self.config.deterministic_mode
+                else "fla.chunk_gated_delta_rule",
+            },
+        )
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
             query,
             key,

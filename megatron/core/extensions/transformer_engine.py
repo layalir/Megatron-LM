@@ -84,6 +84,96 @@ except ImportError:
         HAVE_TE = False
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
+_TE_ATTN_DIM_LOGGED: set[tuple] = set()
+
+
+def _te_attention_dim_logging_enabled() -> bool:
+    return os.getenv("MCORE_ATTN_DIM_LOG", "1").lower() not in {"0", "false", "no", "off"}
+
+
+def _te_attention_dim_log_limit() -> int:
+    try:
+        return int(os.getenv("MCORE_ATTN_DIM_LOG_LIMIT", "64"))
+    except ValueError:
+        return 64
+
+
+def _te_global_rank() -> int:
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    return 0
+
+
+def _te_rank_allowed(global_rank: int) -> bool:
+    rank_spec = os.getenv("MCORE_ATTN_DIM_LOG_RANKS")
+    if not rank_spec:
+        return True
+    try:
+        for item in rank_spec.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "-" in item:
+                start, end = (int(part.strip()) for part in item.split("-", 1))
+                if start <= global_rank <= end:
+                    return True
+            elif int(item) == global_rank:
+                return True
+    except ValueError:
+        return True
+    return False
+
+
+def _te_dtype_name(tensor: Optional[torch.Tensor]) -> str:
+    if tensor is None:
+        return "None"
+    return str(tensor.dtype).replace("torch.", "")
+
+
+def _te_shape_tuple(tensor: Optional[torch.Tensor]) -> tuple | None:
+    if tensor is None:
+        return None
+    return tuple(tensor.shape)
+
+
+def _te_tensor_bshd_dims(tensor: Tensor, qkv_format: str, prefix: str) -> dict[str, Any]:
+    shape = tuple(tensor.shape)
+    dims: dict[str, Any] = {f"{prefix}_shape": shape}
+    if qkv_format == "sbhd" and len(shape) >= 4:
+        dims.update(
+            {
+                f"{prefix}_s": shape[0],
+                f"{prefix}_b": shape[1],
+                f"h_{prefix}": shape[2],
+                f"d_{prefix}": shape[3],
+            }
+        )
+    elif qkv_format == "bshd" and len(shape) >= 4:
+        dims.update(
+            {
+                f"{prefix}_b": shape[0],
+                f"{prefix}_s": shape[1],
+                f"h_{prefix}": shape[2],
+                f"d_{prefix}": shape[3],
+            }
+        )
+    elif qkv_format == "thd" and len(shape) >= 3:
+        dims.update({f"{prefix}_tokens": shape[0], f"h_{prefix}": shape[1], f"d_{prefix}": shape[2]})
+    return dims
+
+
+def _te_emit_attention_dim_log(tag: str, fields: dict) -> None:
+    if not _te_attention_dim_logging_enabled():
+        return
+    global_rank = fields.get("global_rank")
+    if isinstance(global_rank, int) and not _te_rank_allowed(global_rank):
+        return
+    key = (tag, tuple((name, str(value)) for name, value in fields.items()))
+    if key in _TE_ATTN_DIM_LOGGED or len(_TE_ATTN_DIM_LOGGED) >= _te_attention_dim_log_limit():
+        return
+    _TE_ATTN_DIM_LOGGED.add(key)
+    body = " ".join(f"{name}={value}" for name, value in fields.items())
+    print(f"[MCORE_ATTN_DIM][{tag}] {body}", flush=True)
 
 
 class TransformerEngineConfigType(enum.Enum):
@@ -1612,6 +1702,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             )
 
         self.config = config
+        self.layer_number = layer_number
         self.te_forward_mask_type = False
         self.qkv_format: str = "sbhd"
         # Default to 1 split when batch-invariant mode is enabled, unless explicitly overridden
@@ -1840,6 +1931,55 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             ):
                 #  need to change mask type for SWA inference decode stage.
                 attn_mask_type = AttnMaskType.causal_bottom_right
+        is_swa_layer = self.layer_number is not None and is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
+        )
+        attention_variant = "swa_gqa" if is_swa_layer else "gqa"
+        fields = {
+            "layer": self.layer_number,
+            "global_rank": _te_global_rank(),
+            "tp_rank": get_pg_rank(self._tp_group),
+            "tp_world": get_pg_size(self._tp_group),
+            "cp_world_config": self.config.context_parallel_size,
+            "variant": attention_variant,
+            "qkv_format": qkv_format,
+            "attn_mask_type": attn_mask_type.name,
+            "window_size": self.config.window_size,
+            "global_num_attention_heads": self.config.num_attention_heads,
+            "global_num_query_groups": self.config.num_query_groups,
+            "num_gqa_groups_arg": self.config.num_query_groups,
+            "q_dtype": _te_dtype_name(query),
+            "k_dtype": _te_dtype_name(key),
+            "v_dtype": _te_dtype_name(value),
+            **_te_tensor_bshd_dims(query, qkv_format, "q"),
+            **_te_tensor_bshd_dims(key, qkv_format, "k"),
+            **_te_tensor_bshd_dims(value, qkv_format, "v"),
+            "packed_max_seqlen_q": getattr(packed_seq_params, "max_seqlen_q", None)
+            if packed_seq_params is not None
+            else None,
+            "packed_max_seqlen_kv": getattr(packed_seq_params, "max_seqlen_kv", None)
+            if packed_seq_params is not None
+            else None,
+            "packed_cu_seqlens_q_len": getattr(packed_seq_params, "cu_seqlens_q", None).numel()
+            if packed_seq_params is not None
+            and getattr(packed_seq_params, "cu_seqlens_q", None) is not None
+            else None,
+            "packed_cu_seqlens_kv_len": getattr(packed_seq_params, "cu_seqlens_kv", None).numel()
+            if packed_seq_params is not None
+            and getattr(packed_seq_params, "cu_seqlens_kv", None) is not None
+            else None,
+            "packed_b_q": getattr(packed_seq_params, "cu_seqlens_q", None).numel() - 1
+            if packed_seq_params is not None
+            and getattr(packed_seq_params, "cu_seqlens_q", None) is not None
+            else None,
+            "packed_b_kv": getattr(packed_seq_params, "cu_seqlens_kv", None).numel() - 1
+            if packed_seq_params is not None
+            and getattr(packed_seq_params, "cu_seqlens_kv", None) is not None
+            else None,
+            "backend": "transformer_engine.DotProductAttention",
+        }
+        _te_emit_attention_dim_log("TE_DPA_INPUT", fields)
+
         if self.te_forward_mask_type:
             if qkv_format == "thd" and is_te_min_version("1.7.0"):
                 # thd format uses flash attention with cuDNN kernel which requires is_padding=True,
