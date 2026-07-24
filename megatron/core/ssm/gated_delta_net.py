@@ -62,6 +62,17 @@ except ImportError:
 
     HAVE_FLA = False
 
+try:
+    from cudnn.linear_attention.ops import gated_delta_net as cudnn_gated_delta_net
+
+    HAVE_CUDNN_GDN = True
+    _CUDNN_GDN_IMPORT_ERROR = None
+except Exception as e:
+    cudnn_gated_delta_net = None
+
+    HAVE_CUDNN_GDN = False
+    _CUDNN_GDN_IMPORT_ERROR = e
+
 logger = logging.getLogger(__name__)
 
 _ATTN_DIM_LOGGED: set[tuple] = set()
@@ -180,6 +191,15 @@ class GatedDeltaNet(MegatronModule):
             raise ImportError(
                 "FLA is not installed. Please install it with `pip install flash-linear-attention`."
             )
+        if config.gated_delta_net_backend == "cudnn" and not HAVE_CUDNN_GDN:
+            message = (
+                "cuDNN GDN is not available. Install a cuDNN frontend build that provides "
+                "`from cudnn.linear_attention.ops import gated_delta_net`, or use "
+                "gated_delta_net_backend='fla'."
+            )
+            if _CUDNN_GDN_IMPORT_ERROR is not None:
+                message += f" Import failed with: {_CUDNN_GDN_IMPORT_ERROR!r}"
+            raise ImportError(message)
 
         super().__init__(config)
 
@@ -282,7 +302,10 @@ class GatedDeltaNet(MegatronModule):
         setattr(self.A_log, "tensor_model_parallel", True)
         setattr(self.A_log, "partition_dim", 0)
 
-        if self.config.deterministic_mode:
+        self.gated_delta_net_backend = self.config.gated_delta_net_backend
+        if self.gated_delta_net_backend == "cudnn":
+            self.gated_delta_rule = cudnn_gated_delta_net
+        elif self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
@@ -542,10 +565,21 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        logical_h_qk = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
-        logical_h_v = self.v_dim_local_tp // self.value_head_dim // self.cp_size
+        logical_h_qk = query.shape[2]
+        logical_h_v = value.shape[2]
+        if self.gated_delta_net_backend == "fla":
+            query, key = self._repeat_query_key_for_gated_delta_rule(query, key)
+        backend = (
+            "torch_chunk_gated_delta_rule"
+            if self.config.deterministic_mode
+            else (
+                "cudnn.linear_attention.ops.gated_delta_net"
+                if self.gated_delta_net_backend == "cudnn"
+                else "fla.chunk_gated_delta_rule"
+            )
+        )
         _emit_attention_dim_log(
-            "GDN_FLA_INPUT",
+            "GDN_INPUT",
             {
                 "layer": self.layer_number,
                 "global_rank": _global_rank(),
@@ -575,21 +609,11 @@ class GatedDeltaNet(MegatronModule):
                 "v_dtype": _dtype_name(value),
                 "g_dtype": _dtype_name(g),
                 "beta_dtype": _dtype_name(beta),
-                "backend": "torch_chunk_gated_delta_rule"
-                if self.config.deterministic_mode
-                else "fla.chunk_gated_delta_rule",
+                "backend": backend,
             },
         )
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
+        core_attn_out, last_recurrent_state = self._run_gated_delta_rule(
+            query, key, value, g, beta, cu_seqlens_q
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -654,7 +678,7 @@ class GatedDeltaNet(MegatronModule):
     def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
         """
         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
-        Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
+        Fuses split, reshape, L2 norm, and contiguous operations.
         """
         # Split qkv into query_key and value
         query_key, value = torch.split(
@@ -675,12 +699,6 @@ class GatedDeltaNet(MegatronModule):
         split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
-        # Expand query and key if needed (grouped query attention)
-        if self.num_value_heads // self.num_key_heads > 1:
-            repeat_factor = self.num_value_heads // self.num_key_heads
-            query = query.repeat_interleave(repeat_factor, dim=2)
-            key = key.repeat_interleave(repeat_factor, dim=2)
-
         # Make all tensors contiguous
         query = query.contiguous()
         key = key.contiguous()
@@ -690,6 +708,81 @@ class GatedDeltaNet(MegatronModule):
         alpha = alpha.contiguous()
 
         return query, key, value, gate, beta, alpha
+
+    def _repeat_query_key_for_gated_delta_rule(self, query: Tensor, key: Tensor):
+        """Match the legacy FLA kernel contract by expanding Q/K to value-head count."""
+        repeat_factor = self.num_value_heads // self.num_key_heads
+        if repeat_factor > 1:
+            query = query.repeat_interleave(repeat_factor, dim=2)
+            key = key.repeat_interleave(repeat_factor, dim=2)
+        return query.contiguous(), key.contiguous()
+
+    def _run_cudnn_gated_delta_net(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        g: Tensor,
+        beta: Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+    ):
+        """Run cuDNN GDN with dense or packed THD inputs."""
+        scale = 1.0 / (query.shape[-1] ** 0.5)
+        if cu_seqlens is None:
+            return self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                scale=scale,
+                initial_state=None,
+                output_final_state=False,
+            )
+
+        batch, seq_len, h_qk, d_qk = query.shape
+        _, _, h_v, d_v = value.shape
+        assert batch == 1, "Packed sequence GDN expects batch dimension to be 1"
+
+        core_attn_out, last_recurrent_state = self.gated_delta_rule(
+            query.reshape(batch * seq_len, h_qk, d_qk),
+            key.reshape(batch * seq_len, h_qk, d_qk),
+            value.reshape(batch * seq_len, h_v, d_v),
+            g.reshape(batch * seq_len, h_v),
+            beta.reshape(batch * seq_len, h_v),
+            scale=scale,
+            initial_state=None,
+            output_final_state=False,
+            cu_seqlens=cu_seqlens,
+        )
+        core_attn_out = core_attn_out.reshape(batch, seq_len, h_v, d_v)
+        if last_recurrent_state is not None and last_recurrent_state.numel() == 0:
+            last_recurrent_state = None
+        return core_attn_out, last_recurrent_state
+
+    def _run_gated_delta_rule(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        g: Tensor,
+        beta: Tensor,
+        cu_seqlens: Optional[torch.Tensor],
+    ):
+        if self.gated_delta_net_backend == "cudnn":
+            return self._run_cudnn_gated_delta_net(query, key, value, g, beta, cu_seqlens)
+
+        return self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens,
+        )
 
     @jit_fuser
     def _compute_g_and_beta(self, A_log_local_cp, dt_bias_local_cp, alpha, beta):

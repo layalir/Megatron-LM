@@ -327,6 +327,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gated_delta_net_backend: Literal['fla', 'cudnn'] = 'fla'
+    """Backend for the gated delta rule kernel used by gated delta net linear attention."""
+
     ####################
     # initialization
     ####################
@@ -1248,6 +1251,15 @@ class TransformerConfig(ModelParallelConfig):
                 f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
+            if self.gated_delta_net_backend not in ("fla", "cudnn"):
+                raise ValueError(
+                    f"gated_delta_net_backend must be 'fla' or 'cudnn', "
+                    f"got {self.gated_delta_net_backend}."
+                )
+            if self.gated_delta_net_backend == "cudnn" and self.deterministic_mode:
+                raise ValueError(
+                    "gated_delta_net_backend='cudnn' is not supported with deterministic_mode."
+                )
 
             # Check tensor parallelism compatibility
             tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
