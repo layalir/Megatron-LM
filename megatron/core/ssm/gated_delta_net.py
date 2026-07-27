@@ -728,32 +728,27 @@ class GatedDeltaNet(MegatronModule):
     ):
         """Run cuDNN GDN with dense or packed THD inputs."""
         scale = 1.0 / (query.shape[-1] ** 0.5)
-        if cu_seqlens is None:
-            return self.gated_delta_rule(
-                query,
-                key,
-                value,
-                g,
-                beta,
-                scale=scale,
-                initial_state=None,
-                output_final_state=False,
-            )
-
         batch, seq_len, h_qk, d_qk = query.shape
         _, _, h_v, d_v = value.shape
-        assert batch == 1, "Packed sequence GDN expects batch dimension to be 1"
+
+        if cu_seqlens is None:
+            cu_seqlens = (
+                torch.arange(batch + 1, device=query.device, dtype=torch.int32) * seq_len
+            )
+        else:
+            assert batch == 1, "Packed sequence GDN expects batch dimension to be 1"
+            cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
 
         core_attn_out, last_recurrent_state = self.gated_delta_rule(
             query.reshape(batch * seq_len, h_qk, d_qk),
             key.reshape(batch * seq_len, h_qk, d_qk),
             value.reshape(batch * seq_len, h_v, d_v),
-            g.reshape(batch * seq_len, h_v),
-            beta.reshape(batch * seq_len, h_v),
+            g.float().reshape(batch * seq_len, h_v),
+            beta.float().reshape(batch * seq_len, h_v),
+            cu_seqlens,
             scale=scale,
             initial_state=None,
             output_final_state=False,
-            cu_seqlens=cu_seqlens,
         )
         core_attn_out = core_attn_out.reshape(batch, seq_len, h_v, d_v)
         if last_recurrent_state is not None and last_recurrent_state.numel() == 0:
