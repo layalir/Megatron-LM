@@ -100,8 +100,84 @@ policy-step speedups. Selection from a sweep requires independent confirmation.
 
 The combined revision-5 candidate subsequently passed all 21 focused tests
 and the five-case preparation suite on all four GPUs in the nightly-derived
-image, without changing tolerances. Revision-5 proxy and full-workload timing
-are not yet available.
+image, without changing tolerances. Installed-image validation measured
+preparation control forward/backward times of 622.370/2575.751 us versus
+298.669/1147.833 us fused, reductions of 52.011%/55.437%. These are region
+measurements, not complete policy-training timings.
+
+### Revision 5 Matched Policy Proxy
+
+A completed, unprofiled four-GB300 run retained all 220 raw steps across the
+paired and four fresh-process trials. Both modes used the same installed
+revision-5 image with `MCORE_GDN_COMMON_OPT=1`; only `MCORE_GDN_FUSION` changed.
+The immutable nightly-derived image contains the six fusion modules from
+commit `c6f2f530bec22b0efc16c92288e27204c49e2643`; subsequent upstream merges
+on the branch are not additional changes to the measured runtime.
+The four-layer, 65536-token workload used TP4/CP1/PP1/EP1, micro/global batch
+one, random weights, mock rollouts, seed 1234, and positive-example NLL weight
+0.1. Both NVTX flags were off. Logprob refresh, mode switching, and audit RPCs
+were outside the unchanged `policy.train()` timer in both modes.
+
+| Protocol | Control mean (s) | Fused mean (s) | Time reduction |
+| --- | ---: | ---: | ---: |
+| Paired, steps 21-100 | 1.375094643 | 1.366242259 | 0.643765% |
+| Fresh A1/B1/B2/A2, steps 11-30 each | 1.398834160 | 1.386652281 | 0.870859% |
+
+The paired run used twenty counterbalanced four-step ABBA/BAAB blocks after
+twenty warmup steps. Its 95% block-bootstrap interval was
+[0.501090%, 0.790421%]. This is within-run uncertainty, not a confidence
+interval across independent jobs. The fresh aggregate contains only two
+trials per mode; all samples, including the slower trials, were retained.
+Source, runtime, selector, activation, and final worker audits passed on all
+four ranks in every stage, and independent recomputation matched the results.
+
+This control isolates the fusion paths from the shared metadata/indexing and
+existing FLA launch optimizations. It is not an incremental revision-5 versus
+revision-4 comparison. Absolute historical proxy times are not comparable
+because the historical NLL/NVTX and monitoring settings differed. The result
+does not establish a full-model actual-GRPO or rollout-generation speedup.
+
+### Revision 5 Full-Model Actual GRPO
+
+Job 3011294 completed all ten steps and the scheduled evaluation on sixteen
+nodes / 64 GB300 GPUs, with eight training and eight generation nodes, real
+rollouts, and the full 60-layer Qwen3.5-397B model. It used the same installed
+revision-5 image as the proxy and the established nightly configuration,
+retaining TP4/PP2/EP16/ETP1/CP1, generation TP8/EP8/PP1, 32 prompts x 16
+generations, sequence packing, a 65536-token limit, and seed 28323. Runtime was
+2h07m19s within the original 160-minute Slurm and 150-minute driver limits.
+
+The predeclared primary metric was mean policy-training time over steps 2-10
+against stock nightly job 2987001. All ten steps and evaluation are retained:
+
+| Metric and window | Nightly mean (s) | Revision 5 mean (s) | Time reduction |
+| --- | ---: | ---: | ---: |
+| Policy training, steps 2-10 | 165.554579 | 162.287602 | 1.973354% |
+| Policy training, steps 1-10 | 166.660857 | 163.659341 | 1.800972% |
+| Full GRPO step, steps 2-10 | 573.127475 | 565.205233 | 1.382283% |
+| Full GRPO step, steps 1-10 | 540.574547 | 533.471137 | 1.314048% |
+
+The observed policy-time reduction exceeds the 0.5% target in this run. Final
+audits identified all 32 policy-worker ranks with both fusion paths active;
+all ten native timing and training-stat records passed integrity checks.
+Native validation accuracy was 0.741035879, above the unchanged 0.69 threshold,
+and the run logged success without a forced-success override. The nightly
+recorded 0.693227112. These single-run scores do not establish equivalent
+convergence or an accuracy improvement caused by fusion.
+
+This is an unpaired stock-nightly versus optimization-bundle comparison,
+not a full-model fusion-only ablation. The stock nightly lacks the common
+optimizations; asynchronous trajectories, loss masking, packing, node
+placement, and runtime variability can also affect the observations. The
+candidate inherited `CUDA_DEVICE_ORDER=PCI_BUS_ID`, absent from the saved
+nightly exports. Input-token counts and loss-valid counts are different
+diagnostics, neither a substitute for measured packed compute. The long
+step-9 rollout wait and shorter evaluation remain in the full-step results.
+Use the matched proxy above for fusion-only attribution.
+
+The unchanged compliance checker failed in both the stock nightly and this
+run because `eval_samples` was 251 while its rule expected 256. Successful
+training and the validation threshold are not an MLPerf compliance claim.
 
 ### Historical Bundle Result
 
@@ -129,8 +205,9 @@ preparation-kernel reductions of 44.524% forward and 47.009% backward; these
 kernel sums are not end-to-end timing estimates.
 
 The branch contains the revision-5 kernel settings, corrected gate math, and
-shared control. Validation is tolerance-based, not bitwise identity. No
-revision-5 convergence, full-model speedup, or MLPerf accuracy claim is made.
+shared control. Validation is tolerance-based, not bitwise identity. The
+full-model result is a descriptive single-run comparison, not proof of
+convergence equivalence or official MLPerf compliance.
 
 ## Tests
 
