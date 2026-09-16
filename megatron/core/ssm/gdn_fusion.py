@@ -37,7 +37,8 @@ def enabled(module: torch.nn.Module, projection: torch.Tensor) -> bool:
         and not module.config.deterministic_mode
         and module.activation in ("silu", "swish")
         and module.use_qk_l2norm
-        and module.cp_size == 1
+        and module.cp_size in (1, 4)
+        and module.feat_dim_split == (3072, 2048, 16, 16)
         and module.key_head_dim == 128
         and module.value_head_dim == 128
         and module.num_value_heads // module.num_key_heads == 4
@@ -164,7 +165,7 @@ def linear_conv_backward(
         num_warps=4,
         enable_fp_fusion=False,
     )
-    return dw.sum(0).to(weight.dtype), db.sum(0).to(bias.dtype) if db is not None else None
+    return dw.sum(0).to(weight.dtype), (db.sum(0).to(bias.dtype) if db is not None else None)
 
 
 def backward_impl(

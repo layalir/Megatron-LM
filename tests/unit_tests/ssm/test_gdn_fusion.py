@@ -23,6 +23,45 @@ def test_disabled_preparation_does_not_inspect_inputs(monkeypatch):
     assert not gdn_fusion.enabled(SimpleNamespace(), torch.empty(0))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("cp_size,supported", [(1, True), (2, False), (4, True), (8, False)])
+def test_preparation_context_parallel_dispatch(monkeypatch, cp_size, supported):
+    monkeypatch.setenv("MCORE_GDN_FUSION", "1")
+    module = SimpleNamespace(
+        config=SimpleNamespace(deterministic_mode=False),
+        activation="silu",
+        use_qk_l2norm=True,
+        cp_size=cp_size,
+        feat_dim_split=(3072, 2048, 16, 16),
+        key_head_dim=128,
+        value_head_dim=128,
+        num_key_heads=4 * cp_size,
+        num_value_heads=16 * cp_size,
+        conv1d=SimpleNamespace(weight=torch.empty(3072, 1, 4)),
+    )
+    projection = torch.empty((1, 8, 5152), device="cuda", dtype=torch.bfloat16)
+    with patch.object(gdn_fusion, "_LINEAR_BWD", object()):
+        assert gdn_fusion.enabled(module, projection) is supported
+        module.feat_dim_split = (2048, 3072, 16, 16)
+        assert not gdn_fusion.enabled(module, projection)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("cp_size,supported", [(1, True), (2, False), (4, True), (8, False)])
+def test_output_context_parallel_dispatch(monkeypatch, cp_size, supported):
+    monkeypatch.setenv("MCORE_GDN_FUSION", "1")
+    module = SimpleNamespace(
+        config=SimpleNamespace(deterministic_mode=False),
+        cp_size=cp_size,
+        activation="silu",
+        out_norm=type("RMSNorm", (), {})(),
+    )
+    x = torch.empty((1, 8, 16, 128), device="cuda", dtype=torch.bfloat16)
+    assert gdn_gated_norm.enabled(module, x, x) is supported
+    smaller = torch.empty((1, 8, 4, 128), device="cuda", dtype=torch.bfloat16)
+    assert not gdn_gated_norm.enabled(module, smaller, smaller)
+
+
 def _assert_gradients_close(actual, expected, atol=0.03):
     for got, ref in zip(actual, expected):
         relative_l2 = (got.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-12)

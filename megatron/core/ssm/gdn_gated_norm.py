@@ -196,7 +196,7 @@ def enabled(module: torch.nn.Module, x: torch.Tensor, gate: torch.Tensor) -> boo
     use_fusion = (
         os.getenv("MCORE_GDN_FUSION", "0") == "1"
         and not module.config.deterministic_mode
-        and module.cp_size == 1
+        and module.cp_size in (1, 4)
         and module.activation in ("silu", "swish")
         and type(module.out_norm).__name__ == "RMSNorm"
         and x.is_cuda

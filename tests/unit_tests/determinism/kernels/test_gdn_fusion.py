@@ -43,7 +43,8 @@ def test_preparation_replays(boundaries, has_bias):
 
 @pytest.mark.parametrize("zero_centered", [False, True])
 @pytest.mark.parametrize("strided_gate", [False, True])
-def test_output_norm_replays(monkeypatch, zero_centered, strided_gate):
+@pytest.mark.parametrize("cp_size", [1, 4])
+def test_output_norm_replays(monkeypatch, zero_centered, strided_gate, cp_size):
     te = pytest.importorskip("transformer_engine.pytorch")
     seeded()
     monkeypatch.setenv("MCORE_GDN_FUSION", "1")
@@ -55,7 +56,7 @@ def test_output_norm_replays(monkeypatch, zero_centered, strided_gate):
         def __init__(self):
             super().__init__()
             self.config = SimpleNamespace(deterministic_mode=False)
-            self.cp_size = 1
+            self.cp_size = cp_size
             self.activation = "silu"
             self.out_norm = norm
             self.value_head_dim = 128
