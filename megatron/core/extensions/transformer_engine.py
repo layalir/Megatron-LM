@@ -2181,6 +2181,16 @@ class TEGatedDeltaNetAttention(torch.nn.Module):
             layer_number=layer_number,
         )
 
+    def get_context_parallel_backend(self):
+        """Get TE's local GDN state operations without binding CP head geometry."""
+        factory = getattr(self.te_attention, "get_context_parallel_backend", None)
+        if factory is None:
+            raise RuntimeError(
+                "gdn_cp_mode='chunkwise' requires Transformer Engine GDN state-summary support."
+            )
+        return factory()
+
+
     def forward(
         self,
         q: torch.Tensor,
