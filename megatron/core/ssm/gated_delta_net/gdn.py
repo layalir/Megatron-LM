@@ -209,6 +209,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             inference_context is None and not InferenceMode.is_active()
         ), "Two-stage GDN execution is training-only; inference is dispatched by forward()."
 
+        if self.config.gdn_cp_mode == "chunkwise" and self.cp_size > 1:
+            from megatron.core.ssm.gated_delta_net.chunkwise import forward_chunkwise
+
+            return forward_chunkwise(self, hidden_states, packed_seq_params, self.pg_collection.cp)
+
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * self.cp_size
 
